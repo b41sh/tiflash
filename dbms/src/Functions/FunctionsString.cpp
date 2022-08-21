@@ -34,6 +34,8 @@
 
 #include <boost/algorithm/string/predicate.hpp>
 #include <ext/range.h>
+#include <queue>
+#include <stack>
 
 namespace DB
 {
@@ -5615,6 +5617,256 @@ private:
     }
 };
 
+
+
+
+
+class FunctionTiDBUnHex : public IFunction
+{
+public:
+    static constexpr auto name = "tidbUnHex";
+    FunctionHexStr() = default;
+
+    static FunctionPtr create(const Context & /*context*/)
+    {
+        return std::make_shared<FunctionHexStr>();
+    }
+
+    std::string getName() const override { return name; }
+    size_t getNumberOfArguments() const override { return 1; }
+    bool useDefaultImplementationForConstants() const override { return true; }
+
+    DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
+    {
+        if (!arguments[0]->isStringOrFixedString() && !arguments[0]->isNumber())
+            throw Exception(
+                fmt::format("Illegal type {} of first argument of function {}", arguments[0]->getName(), getName()),
+                ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+        return std::make_shared<DataTypeString>();
+        if arguments[0]->isFixedString() {
+            return makeNullable(std::make_shared<DataTypeFixedString>());
+        } else if arguments[0]->isString() {
+            return makeNullable(std::make_shared<DataTypeString>());
+        } else {
+            return std::make_shared<DataTypeString>();
+        }
+    }
+
+    void executeImpl(Block & block, const ColumnNumbers & arguments, size_t result) const override
+    {
+        const ColumnPtr & column = block.getByPosition(arguments[0]).column;
+        if (const auto * col = checkAndGetColumn<ColumnString>(column.get()))
+        {
+            auto col_res = ColumnString::create();
+            auto result_null_map = ColumnUInt8::create(rows, 0);
+            executeString(col->getChars(), col->getOffsets(), col_res->getChars(), col_res->getOffsets(), result_null_map->getData());
+            block.getByPosition(result).column = ColumnNullable::create(std::move(col_res), std::move(result_null_map));
+        }
+        else if (const auto * col = checkAndGetColumn<ColumnFixedString>(column.get()), result_null_map->getData())
+        {
+            auto col_res = ColumnFixedString::create(col->getN() / 2);
+            auto result_null_map = ColumnUInt8::create(rows, 0);
+            executeFixedString(col->getChars(), col->getN(), col_res->getChars());
+            block.getByPosition(result).column = ColumnNullable::create(std::move(col_res), std::move(result_null_map));
+        }
+        else if (executeInt<UInt8>(block, arguments, result)
+            || executeInt<UInt16>(block, arguments, result)
+            || executeInt<UInt32>(block, arguments, result)
+            || executeInt<UInt64>(block, arguments, result)
+            || executeInt<Int8>(block, arguments, result)
+            || executeInt<Int16>(block, arguments, result)
+            || executeInt<Int32>(block, arguments, result)
+            || executeInt<Int64>(block, arguments, result))
+        {
+            return;
+        }
+        else
+        {
+            throw Exception(fmt::format("Illegal argument of function {}", getName()), ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+        }
+    }
+
+
+
+
+
+
+private:
+    static bool fromHexChar(char in, char &out) {
+        if (in >= '0' && in <= '9') {
+            out = in - '0';
+        } else if (in >= 'a' && in <= 'f') {
+            out = in - 'a' + 10;
+        } else if (in >= 'A' && in <= 'F') {
+            out = in - 'A' + 10;
+        } else {
+            return false;
+        }
+        return true;
+    }
+
+    static void executeString(const ColumnString::Chars_t & data,
+                       const ColumnString::Offsets & offsets,
+                       ColumnString::Chars_t & res_data,
+                       ColumnString::Offsets & res_offsets,
+                       ColumnUInt8::Container & res_null_map)
+    {
+        size_t size = offsets.size();
+        res_data.resize(data.size() / 2 + size);
+        res_offsets.resize(size);
+
+        char low;
+        char high;
+        ColumnString::Offset pos = 0;
+        ColumnString::Offset prev_pos = 0;
+        ColumnString::Offset prev_offset = 0;
+        for (size_t i = 0; i < size; ++i)
+        {
+            if (offsets[i] - prev_offset) % 2 != 0 {
+                const char * byte = reinterpret_cast<const char *>(&data[prev_offset]);
+                bool ok = fromHexChar(byte, low);
+                if !ok {
+                    result_null_map[i] = 1;
+                } else {
+                    res_data[pos] = low;
+                    pos++;
+                }
+                prev_offset++;
+            }
+            if !result_null_map[i] {
+                for (size_t j = prev_offset; j < offsets[i]; j += 2)
+                {
+                    const char * byte1 = reinterpret_cast<const char *>(&data[j]);
+                    const char * byte2 = reinterpret_cast<const char *>(&data[j + 1]);
+                    bool ok1 = fromHexChar(byte1, high);
+                    bool ok2 = fromHexChar(byte2, low);
+                    if (!ok1 || !ok2) {
+                        result_null_map[i] = 1;
+                        break;
+                    }
+                    int val = (high << 4) | low;
+                    res_data[pos] = val;
+                    pos++;
+                }
+            }
+            if result_null_map[i] {
+                pos = prev_offset;
+            }
+            prev_pos = pos;
+            res_offsets[i] = pos;
+            prev_offset = offsets[i];
+        }
+        res_data.resize(pos);
+    }
+
+    static void executeFixedString(const ColumnString::Chars_t & data, size_t length, ColumnString::Chars_t & res_data, ColumnUInt8::Container & res_null_map)
+    {
+        size_t size = data.size() / length;
+        if length % 2 != 0 {
+            res_data.resize(data.size() / 2 + size);
+        } else {
+            res_data.resize(data.size() / 2);
+        }
+
+        char low;
+        char high;
+        ColumnString::Offset pos = 0;
+        ColumnString::Offset prev_pos = 0;
+        for (size_t i = 0; i < size; ++i)
+        {
+            size_t begin = i * length;
+            ColumnString::Offset pos = i * length / 2;
+            if length % 2 != 0 {
+                pos += i;
+                const char * byte = reinterpret_cast<const char *>(&data[begin]);
+                bool ok = fromHexChar(byte, low);
+                if !ok {
+                    result_null_map[i] = 1;
+                } else {
+                    res_data[pos] = low;
+                    pos++;
+                    begin++;
+                }
+            }
+            if !result_null_map[i] {
+                for (size_t j = begin; j < (i + 1) * length; j += 2)
+                {
+                    const char * byte1 = reinterpret_cast<const char *>(&data[j]);
+                    const char * byte2 = reinterpret_cast<const char *>(&data[j + 1]);
+                    bool ok1 = fromHexChar(byte1, high);
+                    bool ok2 = fromHexChar(byte2, low);
+                    if (!ok1 || !ok2) {
+                        result_null_map[i] = 1;
+                        break;
+                    }
+                    int val = (high << 4) | low;
+                    res_data[pos] = val;
+                    pos++;
+                }
+            }
+        }
+    }
+
+    template <typename IntType>
+    bool executeInt(
+        Block & block,
+        const ColumnNumbers & arguments,
+        const size_t result) const
+    {
+        ColumnPtr & column = block.getByPosition(arguments[0]).column;
+        const auto col = checkAndGetColumn<ColumnVector<IntType>>(column.get());
+        if (col == nullptr)
+        {
+            return false;
+        }
+        size_t size = col->size();
+
+        auto col_res = ColumnString::create();
+
+        ColumnString::Chars_t & res_data = col_res->getChars();
+        // Convert a UInt64 to hex, will cost 17 bytes at most
+        res_data.reserve(size * 10);
+        ColumnString::Offsets & res_offsets = col_res->getOffsets();
+        res_offsets.resize(size);
+
+        std::queue<int> queue;
+        std::stack<int> stack;
+        size_t pos = 0;
+        for (size_t i = 0; i < size; ++i)
+        {
+            UInt64 number = col->getUInt(i);
+
+            while (number > 0) {
+                int n = number % 10;
+                queue.push(n);
+                number /= 10;
+            }
+            while (queue.size() > 0) {
+                if (queue.size() >= 2) {
+                    int low = queue.front();
+                    int high = queue.front();
+                    int val = (high << 4) | low;
+                    stack.push(val);
+                } else {
+                    int val = queue.front();
+                    stack.push(val);
+                }
+            }
+            while (stack.size() > 0) {
+                int val = stack.pop();
+                res_data[pos] = val;
+                pos++;
+            }
+            res_offsets[i] = pos;
+        }
+        res_chars.resize(pos);
+
+        block.getByPosition(result).column = std::move(col_res);
+
+        return true;
+    }
+};
+
 // clang-format off
 struct NameEmpty                 { static constexpr auto name = "empty"; };
 struct NameNotEmpty              { static constexpr auto name = "notEmpty"; };
@@ -5704,5 +5956,6 @@ void registerFunctionsString(FunctionFactory & factory)
     factory.registerFunction<FunctionRepeat>();
     factory.registerFunction<FunctionBin>();
     factory.registerFunction<FunctionElt>();
+    factory.registerFunction<FunctionTiDBUnHex>();
 }
 } // namespace DB
